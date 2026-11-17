@@ -1,11 +1,12 @@
 """Fetch the full Instagram "following" list for a user and save it as JSON.
 
-Session values are read from env vars so they never land in the repo:
+Session values come from the root .env (gitignored; see .env.example and
+tools/get_env.js) or from real env vars:
   IG_SESSIONID, IG_CSRFTOKEN, IG_DS_USER_ID  (required)
   IG_TARGET_USER_ID  (optional, defaults to IG_DS_USER_ID)
 
 Usage:
-  IG_SESSIONID=... IG_CSRFTOKEN=... IG_DS_USER_ID=... python3 instagram/fetch_following.py
+  python3 instagram/fetch_following.py
 """
 import json
 import os
@@ -17,6 +18,8 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+import env  # noqa: F401  loads the root .env into os.environ
 
 SESSIONID = os.environ["IG_SESSIONID"]
 CSRF = os.environ["IG_CSRFTOKEN"]
@@ -77,6 +80,11 @@ def main():
         "users": users,
     }, indent=2, ensure_ascii=False))
     print(f"saved {len(users)} users -> {OUT}")
+
+    import db
+
+    new, updated = db.save_accounts(users, TARGET)
+    print(f"social_accounts: {new} new, {updated} updated")
 
 
 if __name__ == "__main__":

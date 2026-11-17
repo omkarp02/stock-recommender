@@ -7,10 +7,12 @@ How it works:
      xig_user_by_username.polaris_ordered_timeline_connection.
      Pinned posts are listed first, so "latest" = the node with the highest pk.
   2. yt-dlp downloads the audio track of /reel/<code>/ or /p/<code>/.
-  3. faster-whisper transcribes it (auto language detection; --translate for English).
+  3. asr.py transcribes it: Whisper detects the language, Hindi goes to Maya
+     Transcribe, everything else stays on Whisper (--translate: Whisper, English).
 
-Results are written to data/latest_posts.json and the run is resumable:
-already-transcribed posts are skipped.
+Results are written to data/latest_posts.json and to MongoDB (social_posts, see
+db.py). The run is resumable: already-transcribed posts are skipped, except
+Hindi posts transcribed by Whisper before Maya was added, which are redone.
 
 Usage:
   .venv/bin/python transcribe_latest.py                 # all users
@@ -29,7 +31,13 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import os
+
 import yt_dlp
+
+import asr
+import db
+import env  # noqa: F401  loads the root .env into os.environ
 
 HERE = Path(__file__).parent
 DATA = HERE / "data"
@@ -84,10 +92,34 @@ def post_url(node):
     return f"https://www.instagram.com/{kind}/{node['code']}/"
 
 
+COOKIE_FILE = DATA / "cookies.txt"
+
+
+def write_cookie_file():
+    """Instagram needs a login to download reels: hand yt-dlp the .env session
+    as a Netscape cookie file (in data/, gitignored, readable only by you)."""
+    cookies = {
+        "sessionid": os.environ.get("IG_SESSIONID"),
+        "csrftoken": os.environ.get("IG_CSRFTOKEN"),
+        "ds_user_id": os.environ.get("IG_DS_USER_ID"),
+    }
+    if not cookies["sessionid"]:
+        print("warning: IG_SESSIONID not set in .env; reel downloads will likely fail", file=sys.stderr)
+        return None
+    DATA.mkdir(parents=True, exist_ok=True)
+    expiry = int(time.time()) + 30 * 86400
+    lines = ["# Netscape HTTP Cookie File"]
+    lines += [f".instagram.com\tTRUE\t/\tTRUE\t{expiry}\t{k}\t{v}" for k, v in cookies.items() if v]
+    COOKIE_FILE.write_text("\n".join(lines) + "\n")
+    COOKIE_FILE.chmod(0o600)
+    return str(COOKIE_FILE)
+
+
 def download_audio(url, stem):
     """Returns (list of audio file paths, timestamp). Images yield no files."""
     MEDIA.mkdir(parents=True, exist_ok=True)
     opts = {
+        "cookiefile": write_cookie_file(),
         "format": "bestaudio/best",
         "outtmpl": str(MEDIA / f"{stem}_%(autonumber)s.%(ext)s"),
         "quiet": True,
@@ -110,32 +142,12 @@ def download_audio(url, stem):
     return [f for f in files if Path(f).exists()], ts
 
 
-_model = None
-DEVICE = "cpu"
-
-
-def transcribe(path, model_name, translate):
-    global _model
-    if _model is None:
-        import av
-        from faster_whisper import WhisperModel
-
-        # faster-whisper 1.2.1 passes metadata_errors=, which PyAV >= 15 removed
-        _open = av.open
-        av.open = lambda *a, metadata_errors=None, **k: _open(*a, **k)
-        print(f"loading whisper model '{model_name}' (first run downloads it)...")
-        _model = WhisperModel(model_name, device=DEVICE, compute_type="int8" if DEVICE == "cpu" else "default")
-    segments, info = _model.transcribe(
-        path, task="translate" if translate else "transcribe", vad_filter=True, beam_size=5
+def needs_maya_redo(rec):
+    """Hindi posts transcribed by Whisper before Maya was added."""
+    return any(
+        t.get("language") == "hi" and not str(t.get("model", "")).startswith("maya")
+        for t in rec.get("transcripts") or []
     )
-    segs = [{"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()} for s in segments]
-    return {
-        "language": info.language,
-        "language_probability": round(info.language_probability, 3),
-        "duration": round(info.duration, 2),
-        "text": " ".join(s["text"] for s in segs),
-        "segments": segs,
-    }
 
 
 def main():
@@ -144,12 +156,10 @@ def main():
                     help="following JSON from fetch_following.py")
     ap.add_argument("--model", default="large-v3-turbo", help="whisper model: tiny/base/small/medium/large-v3-turbo")
     ap.add_argument("--translate", action="store_true", help="translate speech to English")
-    ap.add_argument("--device", default="cpu", help="cpu, or mps (Apple GPU, if your ctranslate2 supports it)")
+    ap.add_argument("--device", default="cpu", help="whisper device: cpu or cuda (Maya picks the Mac GPU itself)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--keep-audio", action="store_true", help="keep downloaded audio files")
     args = ap.parse_args()
-    global DEVICE
-    DEVICE = args.device
 
     users = json.loads(Path(args.following).read_text())["users"]
     if args.limit:
@@ -166,8 +176,11 @@ def main():
                 print("  no posts visible")
                 continue
             prev = results.get(name, {})
-            if prev.get("code") == node["code"] and prev.get("transcripts") is not None:
+            # retry posts whose download failed earlier (they have an empty transcript list)
+            done = prev.get("transcripts") or prev.get("no_audio") or prev.get("media_type") == "image"
+            if prev.get("code") == node["code"] and done and not needs_maya_redo(prev):
                 print(f"  {node['code']} already done, skipping")
+                db.save_post(prev)  # make sure it's in the DB too
                 continue
 
             url = post_url(node)
@@ -175,6 +188,7 @@ def main():
                 "username": name,
                 "full_name": u.get("full_name"),
                 "code": node["code"],
+                "pk": str(node.get("pk")),
                 "url": url,
                 "media_type": MEDIA_TYPES.get(node.get("media_type"), node.get("media_type")),
                 "product_type": node.get("product_type"),
@@ -185,15 +199,20 @@ def main():
             rec["posted_at"] = datetime.fromtimestamp(ts, timezone.utc).isoformat() if ts else None
             rec["transcripts"] = []
             for f in files:
-                t = transcribe(f, args.model, args.translate)
-                rec["transcripts"].append(t)
-                print(f"  {node['code']} [{t['language']}, {t['duration']}s] {t['text'][:100]}")
+                t = asr.transcribe(f, args.model, args.translate, args.device)
                 if not args.keep_audio:
                     Path(f).unlink(missing_ok=True)
-            if not files:
+                if t is None:
+                    continue  # silent clip
+                rec["transcripts"].append(t)
+                print(f"  {node['code']} [{t['language']}, {t['duration']}s, {t['model']}] {t['text'][:100]}")
+            if files and not rec["transcripts"]:
+                rec["no_audio"] = True  # downloaded fine but silent: don't retry next run
+            if not rec["transcripts"]:
                 print(f"  {node['code']} has no audio ({rec['media_type']}); caption saved")
             rec["transcript"] = "\n\n".join(t["text"] for t in rec["transcripts"])
             results[name] = rec
+            db.save_post(rec)
         except Exception as e:  # keep going on per-user failures
             print(f"  error: {e}", file=sys.stderr)
             results[name] = {"username": name, "error": str(e)}

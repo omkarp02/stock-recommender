@@ -1,2 +1,11 @@
+# Python 3.12 (uv venv --python 3.12 .venv)
 faster-whisper==1.2.1
 yt-dlp
+pymongo
+# Maya Transcribe (Hindi), pinned to the versions the model card was validated with
+transformers==5.20.2
+torch==2.15.0
+accelerate==1.15.0
+soundfile==0.14.0
+librosa==1.0.0
+huggingface_hub
